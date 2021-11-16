@@ -11,6 +11,10 @@ import midas.utils
 from midas.models.midas_net import MidasNet
 from midas.models.transforms import Resize, NormalizeImage, PrepareForNet
 
+#AdelaiDepth
+from lib.multi_depth_model_woauxi import RelDepthModel
+from lib.net_tools import strip_prefix_if_present
+
 # PIX2PIX : MERGE NET
 from pix2pix.options.test_options import TestOptions
 from pix2pix.models.pix2pix4depth_model import Pix2Pix4DepthModel
@@ -32,6 +36,7 @@ print("device: %s" % device)
 pix2pixmodel = None
 midasmodel = None
 srlnet = None
+leresmodel = None
 factor = None
 whole_size_threshold = 3000  # R_max from the paper
 GPU_threshold = 1600 - 32 # Limit for the GPU (NVIDIA RTX 2080), can be adjusted 
@@ -61,6 +66,17 @@ def run(dataset, option):
         checkpoint = torch.load('structuredrl/model.pth.tar')
         srlnet.load_state_dict(checkpoint['state_dict'])
         srlnet.eval()
+    elif option.depthNet == 2:
+        global leresmodel
+        leres_model_path = "res101.pth"
+        checkpoint = torch.load(leres_model_path)
+        leresmodel = RelDepthModel(backbone='resnext101')
+        leresmodel.load_state_dict(strip_prefix_if_present(checkpoint['depth_model'], "module."),
+                                    strict=True)
+        del checkpoint
+        torch.cuda.empty_cache()
+        leresmodel.to(device)
+        leresmodel.eval()
 
     # Generating required directories
     result_dir = option.output_dir
@@ -135,19 +151,47 @@ def run(dataset, option):
         factor = max(min(1, 4 * patch_scale * whole_image_optimal_size / whole_size_threshold), 0.2)
         print('Adjust factor is:', 1/factor)
 
-        # Compute the target resolution.
+        # Check if Local boosting is beneficial.
+        if option.max_res < whole_image_optimal_size:
+            print("No Local boosting. Specified Max Res is smaller than R20")
+            path = os.path.join(result_dir, images.name)
+            if option.output_resolution == 1:
+                midas.utils.write_depth(path,
+                                        cv2.resize(whole_estimate,
+                                                   (input_resolution[1], input_resolution[0]),
+                                                   interpolation=cv2.INTER_CUBIC), bits=2,
+                                        colored=option.colorize_results)
+            else:
+                midas.utils.write_depth(path, whole_estimate, bits=2,
+                                        colored=option.colorize_results)
+            continue
+
+        # Compute the default target resolution.
         if img.shape[0] > img.shape[1]:
-            a = 2*whole_image_optimal_size
-            b = round(2*whole_image_optimal_size*img.shape[1]/img.shape[0])
+            a = 2 * whole_image_optimal_size
+            b = round(2 * whole_image_optimal_size * img.shape[1] / img.shape[0])
         else:
-            a = round(2*whole_image_optimal_size*img.shape[0]/img.shape[1])
-            b = 2*whole_image_optimal_size
+            a = round(2 * whole_image_optimal_size * img.shape[0] / img.shape[1])
+            b = 2 * whole_image_optimal_size
+        b = int(round(b / factor))
+        a = int(round(a / factor))
 
-        img = cv2.resize(img, (round(b/factor), round(a/factor)), interpolation=cv2.INTER_CUBIC)
+        # recompute a, b and saturate to max res.
+        if max(a,b) > option.max_res:
+            print('Default Res is higher than max-res: Reducing final resolution')
+            if img.shape[0] > img.shape[1]:
+                a = option.max_res
+                b = round(option.max_res * img.shape[1] / img.shape[0])
+            else:
+                a = round(option.max_res * img.shape[0] / img.shape[1])
+                b = option.max_res
+            b = int(b)
+            a = int(a)
 
-        base_size = option.net_receptive_field_size*2
+        img = cv2.resize(img, (b, a), interpolation=cv2.INTER_CUBIC)
 
         # Extract selected patches for local refinement
+        base_size = option.net_receptive_field_size*2
         patchset = generatepatchs(img, base_size)
 
         print('Target resolution: ', img.shape)
@@ -374,6 +418,8 @@ def singleestimate(img, msize, net_type):
         return estimatemidas(img, msize)
     elif net_type == 1:
         return estimatesrl(img, msize)
+    elif net_type == 2:
+        return estimateleres(img, msize)
 
 
 # Inference on SGRNet
@@ -443,6 +489,42 @@ def estimatemidas(img, msize):
     return prediction
 
 
+def scale_torch(img):
+    """
+    Scale the image and output it in torch.tensor.
+    :param img: input rgb is in shape [H, W, C], input depth/disp is in shape [H, W]
+    :param scale: the scale factor. float
+    :return: img. [C, H, W]
+    """
+    if len(img.shape) == 2:
+        img = img[np.newaxis, :, :]
+    if img.shape[2] == 3:
+        transform = transforms.Compose([transforms.ToTensor(),
+		                                transforms.Normalize((0.485, 0.456, 0.406) , (0.229, 0.224, 0.225) )])
+        img = transform(img.astype(np.float32))
+    else:
+        img = img.astype(np.float32)
+        img = torch.from_numpy(img)
+    return img
+
+# Inference on LeRes
+def estimateleres(img, msize):
+    # LeReS forward pass script adapted from https://github.com/aim-uofa/AdelaiDepth/tree/main/LeReS
+
+    rgb_c = img[:, :, ::-1].copy()
+    A_resize = cv2.resize(rgb_c, (msize, msize))
+    img_torch = scale_torch(A_resize)[None, :, :, :]
+
+    # Forward pass
+    with torch.no_grad():
+        prediction = leresmodel.inference(img_torch)
+
+    prediction = prediction.squeeze().cpu().numpy()
+    prediction = cv2.resize(prediction, (img.shape[1], img.shape[0]), interpolation=cv2.INTER_CUBIC)
+
+    return prediction
+
+
 if __name__ == "__main__":
     # Adding necessary input arguments
     parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -459,11 +541,12 @@ if __name__ == "__main__":
     parser.add_argument('--net_receptive_field_size', type=int, required=False)  # Do not set the value here
     parser.add_argument('--pix2pixsize', type=int, default=1024, required=False)  # Do not change it
     parser.add_argument('--depthNet', type=int, default=0, required=False,
-                        help='use to select different base depth networks 0:midas 1:strurturedRL')
+                        help='use to select different base depth networks 0:midas 1:strurturedRL 2:LeRes')
     parser.add_argument('--colorize_results', action='store_true')
     parser.add_argument('--R0', action='store_true')
     parser.add_argument('--R20', action='store_true')
     parser.add_argument('--Final', action='store_true')
+    parser.add_argument('--max_res', type=float, default=np.inf)
 
     # Check for required input
     option_, _ = parser.parse_known_args()
@@ -484,8 +567,11 @@ if __name__ == "__main__":
     elif option_.depthNet == 1:
         option_.net_receptive_field_size = 448
         option_.patch_netsize = 2*option_.net_receptive_field_size
+    elif option_.depthNet == 2:
+        option_.net_receptive_field_size = 448
+        option_.patch_netsize = 2 * option_.net_receptive_field_size
     else:
-        assert False, 'depthNet can only be 0,1'
+        assert False, 'depthNet can only be 0,1 or 2'
 
     # Create dataset from input images
     dataset_ = ImageDataset(option_.data_dir, 'test')
